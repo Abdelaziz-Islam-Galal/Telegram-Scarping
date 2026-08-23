@@ -45,13 +45,11 @@ class StartAuthRequest(BaseModel):
 class StartAuthResponse(BaseModel):
     status: str
     phone_number: str
-    phone_code_hash: str
 
 
 class VerifyAuthRequest(BaseModel):
     phone_number: str
     code: str
-    phone_code_hash: str
     password: Optional[str] = None  # only needed if the account has 2FA enabled
 
 
@@ -82,7 +80,6 @@ async def start_auth(payload: StartAuthRequest, request: Request):
     return StartAuthResponse(
         status="code_sent",
         phone_number=result.phone_number,
-        phone_code_hash=result.phone_code_hash,
     )
 
 
@@ -94,7 +91,6 @@ async def verify_auth(payload: VerifyAuthRequest, request: Request):
         result = await service.verify_code(
             phone_number=payload.phone_number,
             code=payload.code,
-            phone_code_hash=payload.phone_code_hash,
             password=payload.password,
         )
     except ValueError as e:
