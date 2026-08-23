@@ -7,7 +7,7 @@ and persists the resulting session strings ("tokens") in PostgreSQL.
 Flow:
     1. send_code(phone_number)
        -> triggers Telegram to send a login code via SMS / the app
-    2. verify_code(phone_number, code, phone_code_hash, password=None)
+    2. verify_code(phone_number, code, password=None)
        -> completes login, saves the session string to Postgres
 
 Note: Telegram's user-account API has no redirect-based OAuth2 flow
@@ -41,7 +41,7 @@ from telethon.errors import (
 )
 from dotenv import load_dotenv
 
-load_dotenv()
+load_dotenv(override=True)  # override to ensure test env vars are used in tests
 
 API_ID_RAW = os.getenv("TELEGRAM_API_ID")
 API_HASH = os.getenv("TELEGRAM_API_HASH")
@@ -65,9 +65,11 @@ CREATE TABLE IF NOT EXISTS telegram_sessions (
 );
 """
 
-# In-memory registry of TelegramClients that are mid-login (between
-# send_code and verify_code). Keyed by phone number so the second call
-# can reuse the same live connection.
+# In-memory registry of pending logins (between send_code and
+# verify_code), keyed by phone number so the second call can reuse the
+# same live connection. Stores the phone_code_hash alongside the client
+# so callers of verify_code only need to supply phone_number + code --
+# they no longer have to round-trip phone_code_hash themselves.
 #
 # NOTE: this only works if send_code and verify_code hit the same
 # process. For a multi-worker deployment, either pin a user to one
@@ -84,7 +86,13 @@ CREATE TABLE IF NOT EXISTS telegram_sessions (
 # connected indefinitely as-is -- there's no expiry/cleanup here yet.
 # Worth adding a background sweep (e.g. drop entries older than the
 # code's actual TTL) before this runs somewhere with real traffic.
-_pending_clients: dict[str, TelegramClient] = {}
+@dataclass
+class _PendingLogin:
+    client: TelegramClient
+    phone_code_hash: str
+
+
+_pending_clients: dict[str, _PendingLogin] = {}
 _pending_lock = asyncio.Lock()
 
 
@@ -191,9 +199,13 @@ class TelegramAuthService:
             raise
 
         # Keep this exact client connected and alive -- verify_code needs
-        # to finish the handshake on this same connection.
+        # to finish the handshake on this same connection. Stash the
+        # phone_code_hash here too so the caller doesn't have to send
+        # it back in verify_code.
         async with _pending_lock:
-            _pending_clients[phone_number] = client
+            _pending_clients[phone_number] = _PendingLogin(
+                client=client, phone_code_hash=sent.phone_code_hash
+            )
 
         return AuthStartResult(phone_number=phone_number, phone_code_hash=sent.phone_code_hash)
 
@@ -201,19 +213,26 @@ class TelegramAuthService:
         self,
         phone_number: str,
         code: str,
-        phone_code_hash: str,
         password: Optional[str] = None,
     ) -> AuthVerifyResult:
-        """Step 2: complete login with the code (and 2FA password if enabled)."""
-        async with _pending_lock:
-            client = _pending_clients.get(phone_number)
+        """Step 2: complete login with the code (and 2FA password if enabled).
 
-        if client is None:
+        phone_code_hash is intentionally not a parameter here -- it's
+        recovered from the pending-login registry that send_code
+        populated, so the caller only needs phone_number + code.
+        """
+        async with _pending_lock:
+            pending = _pending_clients.get(phone_number)
+
+        if pending is None:
             raise RuntimeError(
                 "No pending login for this phone number. Call send_code first "
                 "(or the code expired / the server restarted and you need to "
                 "restart the flow)."
             )
+
+        client = pending.client
+        phone_code_hash = pending.phone_code_hash
 
         # Tracks whether this attempt failed specifically because a 2FA
         # password was needed but not supplied -- that's the one failure
