@@ -2,13 +2,15 @@
 message_cleaner.py
 
 Normalizes raw Telegram message text and groups it into chunks suitable
-for embedding / downstream RAG ingestion.
+for embedding / downstream RAG ingestion. Also provides shared report
+formatting used by ad-hoc fetch scripts.
 """
 
 from __future__ import annotations
 
 import re
 from dataclasses import dataclass
+from datetime import datetime
 from typing import TYPE_CHECKING, Literal, Optional
 
 try:
@@ -21,6 +23,7 @@ if TYPE_CHECKING:
 
 _URL_RE = re.compile(r"https?://\S+")
 _MENTION_RE = re.compile(r"@\w+")
+_HASHTAG_RE = re.compile(r"#\w+")
 _MULTI_WS_RE = re.compile(r"[ \t]+")
 _MULTI_NEWLINE_RE = re.compile(r"\n{3,}")
 _EMOJI_RE = re.compile(
@@ -106,6 +109,17 @@ def convert_emoji_to_text(text: str) -> str:
     return converted
 
 
+def normalize_repeated_chars(text: str, threshold: int = 3, collapse_to: int = 2) -> str:
+    """
+    Collapses long runs of the same character, e.g. 'sooooo good' -> 'soo good'.
+    `threshold` is the minimum run length (in repeats beyond the first char)
+    that triggers collapsing, so short legitimate doubles ('committee',
+    'Mississippi') are left untouched by the default settings.
+    """
+    pattern = re.compile(r"(.)\1{" + str(threshold) + r",}")
+    return pattern.sub(lambda m: m.group(1) * collapse_to, text)
+
+
 @dataclass
 class CleanedMessage:
     message_id: int
@@ -113,6 +127,13 @@ class CleanedMessage:
     text: str
     original_length: int
     cleaned_length: int
+    # Optional passthrough metadata from RawTelegramMessage, when available,
+    # so downstream reporting/formatting doesn't need to re-join against
+    # the raw messages.
+    sender_name: Optional[str] = None
+    chat_title: Optional[str] = None
+    date: Optional[datetime] = None
+    is_outgoing: bool = False
 
 
 @dataclass
@@ -127,8 +148,10 @@ def clean_text(
     text: str,
     strip_urls: bool = True,
     strip_mentions: bool = False,
+    strip_hashtags: bool = False,
     emoji_mode: EmojiMode = "convert",
     expand_abbrevs: bool = True,
+    collapse_repeats: bool = False,
 ) -> str:
     """
     Normalize a single message body: strip noise and collapse whitespace.
@@ -138,6 +161,9 @@ def clean_text(
                                 the sentiment/context legible to the LLM
         "strip"             -- remove emoji entirely (old behavior)
         "keep"              -- leave emoji as-is
+    collapse_repeats:
+        Off by default (it's a lossy transform). Turn on for noisy chat
+        exports where "heyyyyy" / "nooooo" style elongation is common.
     """
     cleaned = text.strip()
 
@@ -145,6 +171,8 @@ def clean_text(
         cleaned = _URL_RE.sub("", cleaned)
     if strip_mentions:
         cleaned = _MENTION_RE.sub("", cleaned)
+    if strip_hashtags:
+        cleaned = _HASHTAG_RE.sub("", cleaned)
 
     if emoji_mode == "strip":
         cleaned = _EMOJI_RE.sub("", cleaned)
@@ -155,6 +183,9 @@ def clean_text(
     if expand_abbrevs:
         cleaned = expand_abbreviations(cleaned)
 
+    if collapse_repeats:
+        cleaned = normalize_repeated_chars(cleaned)
+
     cleaned = _MULTI_WS_RE.sub(" ", cleaned)
     cleaned = _MULTI_NEWLINE_RE.sub("\n\n", cleaned)
     return cleaned.strip()
@@ -164,18 +195,27 @@ def clean_message(
     message: RawTelegramMessage,
     strip_urls: bool = True,
     strip_mentions: bool = False,
+    strip_hashtags: bool = False,
     emoji_mode: EmojiMode = "convert",
     expand_abbrevs: bool = True,
+    collapse_repeats: bool = False,
+    min_length: int = 0,
 ) -> Optional[CleanedMessage]:
-    """Clean one message; returns None if nothing meaningful remains."""
+    """
+    Clean one message; returns None if nothing meaningful remains, or if
+    the cleaned text is shorter than `min_length` characters (useful for
+    dropping "ok" / "lol" / single-emoji messages before embedding).
+    """
     cleaned = clean_text(
         message.text,
         strip_urls=strip_urls,
         strip_mentions=strip_mentions,
+        strip_hashtags=strip_hashtags,
         emoji_mode=emoji_mode,
         expand_abbrevs=expand_abbrevs,
+        collapse_repeats=collapse_repeats,
     )
-    if not cleaned:
+    if not cleaned or len(cleaned) < min_length:
         return None
     return CleanedMessage(
         message_id=message.message_id,
@@ -183,6 +223,10 @@ def clean_message(
         text=cleaned,
         original_length=len(message.text),
         cleaned_length=len(cleaned),
+        sender_name=getattr(message, "sender_name", None),
+        chat_title=getattr(message, "chat_title", None),
+        date=getattr(message, "date", None),
+        is_outgoing=getattr(message, "is_outgoing", False),
     )
 
 
@@ -262,3 +306,44 @@ def chunk_cleaned_messages(
         )
 
     return chunks
+
+
+def format_messages_report(
+    messages: list[CleanedMessage],
+    title: str = "Recent Telegram messages",
+    time_format: str = "%I:%M %p",
+) -> str:
+    """
+    Builds the same human-readable "N. From: ... / Message: ... / [chat id: ...]"
+    report block that fetch_test.py / fetch_test3.py each hand-rolled, from a
+    list of already-cleaned messages. Pass messages produced by clean_message()
+    / clean_messages() so sender_name / chat_title / date are populated.
+    """
+    lines = [title, "=" * max(len(title), 10), ""]
+
+    if not messages:
+        lines.append("No recent messages found.")
+        return "\n".join(lines)
+
+    for i, msg in enumerate(messages, 1):
+        sender = msg.sender_name or "Unknown"
+        chat = msg.chat_title or str(msg.chat_id)
+        when = msg.date.strftime(time_format) if msg.date else "unknown time"
+        lines.extend(
+            [
+                f"{i}. From: {sender} in {chat} (at {when})",
+                f"   Message: {msg.text}",
+                f"   [chat id: {msg.chat_id}]",
+                f"   source message id: {msg.message_id}",
+                "",
+                "-" * 50,
+                "",
+            ]
+        )
+    return "\n".join(lines)
+
+
+def append_report_to_file(report: str, path: str) -> None:
+    """Appends a formatted report block to `path` (creates the file if needed)."""
+    with open(path, "a", encoding="utf-8") as f:
+        f.write("\n\n" + report)
